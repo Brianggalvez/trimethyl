@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: notifications.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: notifications.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module  notifications
+ * @author  Flavio De Stefano &lt;flavio.destefano@caffeinalab.com>
+ */
+
+/**
+ * @property config
+ * @property {String} 	[config.driver="http"] 					The driver to use.
+ * @property {Boolean} 	[config.autoReset=true] 				If true, set the badge count to 0 when you open/resume the application.
+ * @property {String}	[config.androidModule="ti.goosh"]	The name of the Android module to load.
+ * @property {Boolean}  [config.fakeRemoteDeviceUUID=false] Fake a device token
+ * @type {Object}
+ */
+exports.config = _.extend({
+	driver: 'http',
+	autoReset: true,
+	androidModule: 'ti.goosh',
+	fakeRemoteDeviceUUID: false
+}, Alloy.CFG.T ? Alloy.CFG.T.notifications : {});
+
+var Event = require('T/event');
+var Util = require('T/util');
+var Router = require('T/router');
+var Q = require('T/ext/q');
+
+// Because Ti.Goosh has the same syntax of Ti.Network, 
+// we can just assign the module and use it in the same way
+
+/**
+ * The module used for push notifications
+ * @type {Object}
+ */
+exports.PushModule = null;
+
+/**
+ * The options for the registerForPushNotifications method of the push module
+ * @type {Object}
+ */
+exports.PushModuleOpt = {};
+
+if (OS_IOS) {
+	exports.PushModule = Ti.Network;
+	exports.PushModuleOpt.types = [ Ti.Network.NOTIFICATION_TYPE_BADGE, Ti.Network.NOTIFICATION_TYPE_ALERT, Ti.Network.NOTIFICATION_TYPE_SOUND ];
+} else if (OS_ANDROID) {
+	exports.PushModule = require(exports.config.androidModule);
+} else {
+	throw new Error("Notifications: unsupported platform");
+}
+
+// The listeners for all received notification
+exports.PushModuleOpt.callback = function(e) {
+	
+	// We must be sure that the processed payload is the same on every platform,
+	// for this reason we have to parse the JSON as described
+	// in Ti.Goosh documentation: https://github.com/caffeinalab/ti.goosh
+	if (OS_ANDROID) {
+		if (_.isString(e.data)) {
+			try {
+				e.data = JSON.parse(e.data);
+			} catch (ex) {
+				e.data = {};
+			}
+		}
+	}
+
+	// Auto-reset the badge when a notification is received
+	// We are sure the the app is in foreground, otherwise this function is never called on background/killed state.
+	if (exports.config.autoReset === true) {
+		exports.resetBadge();
+	}
+
+	// Call the local module onReceived method
+	if (_.isFunction(exports.onReceived)) {
+		exports.onReceived(e);
+	}
+
+	// And trigger a global event with the payload
+	exports.trigger('received', e);
+};
+
+var interactiveCategories = [];
+var interactiveCategoriesCallbacks = {};
+
+var INTERACTIVE_NOTIFICATIONS_CAPABLE = (OS_IOS &amp;&amp; _.isFunction(Ti.App.iOS.createUserNotificationAction));
+
+/**
+ * Validate a device token using empiric methods.
+ * It only checks the the argument is a string and its length is enough for a valid token.
+ * @param  {String} 	token		The device token
+ * @return {Boolean}
+ */
+exports.validateToken = function(token) {
+	return token != null &amp;&amp; token != "undefined" &amp;&amp; token != "null" &amp;&amp; token.length >= 32;
+};
+
+/**
+ * @property onReceived
+ * A callback called when a notification is received.
+ * You can override this to handle incoming notifications, or just
+ * listen to the global event "notifications.received"
+ */
+exports.onReceived = function(e) {
+	Ti.API.info("Notifications: Received", e);
+};
+
+/**
+ * Load a driver of current module
+ */
+exports.loadDriver = function(name) {
+	return Alloy.Globals.Trimethyl.loadDriver('notifications', name, {
+		subscribe: function(opt) {},
+		unsubscribe: function(opt) {}
+	});
+};
+
+/**
+ * Attach events to current module
+ * @param  {String}   	name 		Event key
+ * @param  {Function} 	cb 		Callback
+ */
+exports.on = exports.event = function(name, cb) {
+	Event.on('notifications.' + name, cb);
+};
+
+/**
+ * Remove events to current module
+ * @param  {String}   	name 		Event key
+ * @param  {Function} 	cb 		Callback
+ */
+exports.off = function(name, cb) {
+	Event.off('notifications.' + name, cb);
+};
+
+/**
+ * Trigger events from current module
+ * @param  {String}   	name 		Event key
+ * @param  {Function} 	cb 		The data
+ */
+exports.trigger = function(name, data) {
+	Event.trigger('notifications.' + name, data);
+};
+
+/**
+ * Activate the notifications without a subscription to a service.
+ * You can use this method to just ask to the user the permissions.
+ * @param  {Object}		[opt]
+ * @param  {Function}	[opt.success]	Callback to invoke on success
+ * @return {Q.Promise}	[opt.error]		Callback to invoke on error
+ */
+exports.activate = function(opt) {
+	opt = _.defaults(opt || {}, {
+		success: Alloy.Globals.noop,
+		error: Alloy.Globals.noop
+	});
+
+	return Q.promise(function(_resolve, _reject) {
+
+		var resolve = function(e) {
+			Ti.API.debug('Notification: activation success', e);
+			exports.trigger('activation.success', e);
+			opt.success(e);
+			_resolve(e);
+		};
+
+		var reject = function(e) {
+			Ti.API.error('Notification: activation error', e);
+			exports.trigger('activation.error', e);
+			opt.error(e);
+			_reject(e);
+		};
+
+		if (exports.config.fakeRemoteDeviceUUID) {
+			Ti.API.warn("Notifications: faking activation");
+			resolve( exports.config.fakeRemoteDeviceUUID );
+			return;
+		}
+
+		var registerForPushNotifications = function() {
+			if (exports.PushModule.remoteNotificationsEnabled) {
+				resolve(exports.PushModule.remoteDeviceUUID);		
+			} else {
+				exports.PushModule.registerForPushNotifications(_.extend(exports.PushModuleOpt, {
+					success: function(e) {
+						resolve(e.deviceToken);
+					},
+					error: reject
+				}));
+			}
+		};
+
+		if (INTERACTIVE_NOTIFICATIONS_CAPABLE) {
+
+			var userNotificationsCallback = function(settings) {
+				// Instantly remove this listener
+				Ti.App.iOS.removeEventListener('usernotificationsettings', userNotificationsCallback);
+
+				if (_.isEmpty(settings.types)) {
+					// The user has not accepted the notifications permissions
+					return reject({ disabled: true });
+				}
+
+				registerForPushNotifications();
+			};
+
+			Ti.App.iOS.addEventListener('usernotificationsettings', userNotificationsCallback);
+			Ti.App.iOS.registerUserNotificationSettings({
+				types: [ 
+				Ti.App.iOS.USER_NOTIFICATION_TYPE_BADGE, 
+				Ti.App.iOS.USER_NOTIFICATION_TYPE_ALERT, 
+				Ti.App.iOS.USER_NOTIFICATION_TYPE_SOUND 
+				],
+				categories: interactiveCategories
+			});
+
+		} else {
+			registerForPushNotifications();
+		}
+
+	});
+};
+
+/**
+ * Deactivate completely the notifications
+ * Per Apple's documentation, it is rarely necessary to call this method.
+ * For example, calling this method would be required if a new version of your application no longer supports push notifications.
+ */
+exports.deactivate = function() {
+	exports.PushModule.unregisterForPushNotifications();
+};
+
+/**
+ * The main method: It activate the notifications (asking to the user the permissions), and sends the device token to your driver.
+ * @param {String} 	[channel] 		Channel name
+ * @param {Object} 	[data] 			Additional data to pass to the driver
+ * @param {Object} 	[opt] 			Additional options to pass to the driver
+ * @return {Q.Promise}
+ */
+exports.subscribe = function(channel, data, opt) {
+	opt = _.defaults(opt || {}, {
+		success: Alloy.Globals.noop,
+		error: Alloy.Globals.noop
+	});
+
+	return Q.promise(function(_resolve, _reject) {
+
+		var resolve = function(e) {
+			Ti.API.debug('Notification: subscription success', e);
+			exports.trigger('subscription.success', e);
+			opt.success(e);
+			_resolve(e);
+		};
+
+		var reject = function(e) {
+			Ti.API.error('Notification: subscription error', e);
+			exports.trigger('subscription.error', e);
+			opt.error(e);
+			_reject(e);
+		};
+
+		if (false == Ti.Network.online) {
+			return reject({
+				offline: true
+			});
+		}
+
+		exports.activate()
+		.then(function(deviceToken) {
+
+			var driver = exports.loadDriver(exports.config.driver);
+
+			driver.subscribe(_.extend({}, opt, {
+				deviceToken: deviceToken,
+				channel: channel,
+				data: data,
+				success: resolve,
+				error: reject
+			}));
+
+		})
+		.fail(reject);
+
+	});
+};
+
+/**
+ * Unsubscribe from a channel using the specified driver.
+ * @param {String} 	[channel] 		Channel name
+ * @param {Object} 	[data] 			Additional data to pass to the driver
+ * @param {Object} 	[opt] 			Additional options to pass to the driver
+ * @return {Q.Promise}
+ */
+exports.unsubscribe = function(channel, data, opt) {
+	opt = _.defaults(opt || {}, {
+		success: Alloy.Globals.noop,
+		error: Alloy.Globals.noop
+	});
+
+	return Q.promise(function(_resolve, _reject) {
+
+		var resolve = function(e) {
+			Ti.API.debug('Notification: subscription success', e);
+			exports.trigger('unsubscription.success', e);
+			opt.success(e);
+			_resolve(e);
+		};
+
+		var reject = function(e) {
+			Ti.API.error('Notification: subscription error', e);
+			exports.trigger('unsubscription.error', e);
+			opt.error(e);
+			_reject(e);
+		};
+
+		if (false == Ti.Network.online) {
+			return reject({
+				offline: true
+			});
+		}
+
+		var driver = exports.loadDriver(exports.config.driver);
+		var device_token = exports.getRemoteDeviceUUID();
+
+		driver.unsubscribe(_.extend({}, opt, {
+			deviceToken: device_token,
+			channel: channel,
+			data: data,
+			success: resolve,
+			error: reject
+		}));
+
+	});
+};
+
+/**
+ * Set the application badge number
+ * @param {Number} 	value
+ */
+exports.setBadge = function(value) {
+	var proxy = OS_IOS ? Ti.UI.iOS : exports.PushModule;
+	proxy.setAppBadge(Math.max(value, 0));
+};
+
+/**
+ * Get the application badge number
+ * @return {Number}
+ */
+exports.getBadge = function() {
+	var proxy = OS_IOS ? Ti.UI.iOS : exports.PushModule;
+	return proxy.getAppBadge();
+};
+
+/**
+ * Set the application badge to zero
+ */
+exports.resetBadge = function() {
+	exports.setBadge(0);
+};
+
+/**
+ * Increment the badge app
+ * @param {Number} value 	The value to increment
+ */
+exports.incBadge = function(value) {
+	exports.setBadge(exports.getBadge() + value);
+};
+
+/**
+ * Get the stored device token.
+ * Don't rely on this method to check if notifications are active, use {@link #isRemoteNotificationsEnabled} instead
+ * @return {String}
+ */
+exports.getRemoteDeviceUUID = function() {
+	if (exports.config.fakeRemoteDeviceUUID) {
+		Ti.API.warn("Notifications: getRemoteDeviceUUID is returning a fake device token");
+		return exports.config.fakeRemoteDeviceUUID;
+	}
+
+	return exports.PushModule.remoteDeviceUUID;
+};
+
+/**
+ * Check if the remote notifications has been registered once.
+ * Use this method at startup in conjunction with `activate()`
+ * @return {Boolean} [description]
+ */
+exports.isRemoteNotificationsEnabled = function() {
+	return exports.PushModule.remoteNotificationsEnabled;
+};
+
+
+///////////////////////////////
+// Interactive notifications //
+///////////////////////////////
+
+// Create a UserNotificationAction Object based on a dictionary.
+function createIntNotifAction(opt) {
+	if (opt.id == null) throw new Error('Notifications: interactive notifications must have and ID');
+	if (opt.title == null) throw new Error('Notifications: interactive notifications must have a title');
+
+	return Ti.App.iOS.createUserNotificationAction({
+		identifier: opt.id,
+		title: opt.title,
+		activationMode: Ti.App.iOS["USER_NOTIFICATION_ACTIVATION_MODE_" + (opt.openApplication == true ? "FOREGROUND" : "BACKGROUND")],
+		destructive: !!opt.destructive,
+		authenticationRequired: !!opt.authenticationRequired
+	});
+}
+
+/**
+ * @param {String}   id       	The ID of the category. It must be unique.
+ * @param {Array}    dict     	An array of actions. Each action must have defined:
+ * `id` (required), the ID of this action
+ * `title` (required) the title to show
+ * `callback` (required) the callback that handle the user click
+ * `openApplication`, `destructive`, `authenticationRequired` are optionals.
+ * @param {Function} callback 	The callback to invoke
+ */
+exports.addInteractiveNotificationCategory = function(id, dict) {
+	if (false == INTERACTIVE_NOTIFICATIONS_CAPABLE) {
+		Ti.API.error("Notifications: unable to create an interactive notification category, not supported");
+		return;
+	}
+
+	var category = Ti.App.iOS.createUserNotificationCategory({
+		identifier: id,
+		actionsForDefaultContext: dict.map(createIntNotifAction)
+	});
+
+	// Add in the interactiveCategories array to register in the activate method
+	interactiveCategories.push(category);
+	interactiveCategoriesCallbacks[ id ] = dict.callback;
+};
+
+//////////
+// Init //
+//////////
+
+if (INTERACTIVE_NOTIFICATIONS_CAPABLE) {
+	Ti.App.iOS.addEventListener('remotenotificationaction', function(e) {
+		var func = interactiveCategoriesCallbacks[ e.category ];
+		if (_.isFunction(func)) {
+			func(e);
+		} else {
+			Ti.API.error('Notifications: remote notification with an unregistered category (' + e.category + ')');
+		}
+	});
+}
+
+if (exports.config.autoReset === true) {
+	exports.resetBadge();
+	Ti.App.addEventListener('resumed', exports.resetBadge);
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-animator.html">animator</a></li><li><a href="module-app.html">app</a></li><li><a href="module-auth.html">auth</a></li><li><a href="module-auth_bypass.html">auth/bypass</a></li><li><a href="module-auth_facebook.html">auth/facebook</a></li><li><a href="module-auth_std.html">auth/std</a></li><li><a href="module-cache.html">cache</a></li><li><a href="module-cache_database.html">cache/database</a></li><li><a href="module-calendar.html">calendar</a></li><li><a href="module-camera.html">camera</a></li><li><a href="module-device.html">device</a></li><li><a href="module-dialog.html">dialog</a></li><li><a href="module-event.html">event</a></li><li><a href="module-fb.html">fb</a></li><li><a href="module-filesystem.html">filesystem</a></li><li><a href="module-flow.html">flow</a></li><li><a href="module-forcetouchmenu.html">forcetouchmenu</a></li><li><a href="module-ga.html">ga</a></li><li><a href="module-geo.html">geo</a></li><li><a href="module-http.html">http</a></li><li><a href="module-image.html">image</a></li><li><a href="module-logger.html">logger</a></li><li><a href="module-logger_api.html">logger/api</a></li><li><a href="module-logger_telegram.html">logger/telegram</a></li><li><a href="module-matrix.html">matrix</a></li><li><a href="module-notifications.html">notifications</a></li><li><a href="module-notifications_cloud.html">notifications/cloud</a></li><li><a href="module-notifications_http.html">notifications/http</a></li><li><a href="module-notifications_parse.html">notifications/parse</a></li><li><a href="module-permissions.html">permissions</a></li><li><a href="module-prop.html">prop</a></li><li><a href="module-router.html">router</a></li><li><a href="module-sharer.html">sharer</a></li><li><a href="module-sounds.html">sounds</a></li><li><a href="module-spotlight.html">spotlight</a></li><li><a href="module-sqlite.html">sqlite</a></li><li><a href="module-support_oauth.html">support/oauth</a></li><li><a href="module-support_xmlparser_extract.html">support/xmlparser/extract</a></li><li><a href="module-support_xmlparser_proxies.html">support/xmlparser/proxies</a></li><li><a href="module-trimethyl.html">trimethyl</a></li><li><a href="module-uifactory.html">uifactory</a></li><li><a href="module-uifactory_backgroundview.html">uifactory/backgroundview</a></li><li><a href="module-uifactory_button.html">uifactory/button</a></li><li><a href="module-uifactory_dateselect.html">uifactory/dateselect</a></li><li><a href="module-uifactory_imageloadingview.html">uifactory/imageloadingview</a></li><li><a href="module-uifactory_imageview.html">uifactory/imageview</a></li><li><a href="module-uifactory_label.html">uifactory/label</a></li><li><a href="module-uifactory_listview.html">uifactory/listview</a></li><li><a href="module-uifactory_navigationwindow.html">uifactory/navigationwindow</a></li><li><a href="module-uifactory_select.html">uifactory/select</a></li><li><a href="module-uifactory_soundcloudclassicwebview.html">uifactory/soundcloudclassicwebview</a></li><li><a href="module-uifactory_tabbedbar.html">uifactory/tabbedbar</a></li><li><a href="module-uifactory_textarea.html">uifactory/textarea</a></li><li><a href="module-uifactory_textfield.html">uifactory/textfield</a></li><li><a href="module-uifactory_timeselect.html">uifactory/timeselect</a></li><li><a href="module-uifactory_view.html">uifactory/view</a></li><li><a href="module-uifactory_window.html">uifactory/window</a></li><li><a href="module-uifactory_youtubevideowebview.html">uifactory/youtubevideowebview</a></li><li><a href="module-uifactory_zoomimageview.html">uifactory/zoomimageview</a></li><li><a href="module-uiutil.html">uiutil</a></li><li><a href="module-util.html">util</a></li><li><a href="module-weballoy.html">weballoy</a></li><li><a href="module-xmlparser.html">xmlparser</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.4.3</a> on Wed Dec 14 2016 16:48:05 GMT+0100 (CET)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
